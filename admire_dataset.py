@@ -9,32 +9,46 @@ from torchvision import transforms
 
 class AdMIReReader(Dataset):
     def __init__(self, data_root_path, split="Train", mode="qwen"):
-        """
-        Args:
-            data_root_path: Path where you unzipped the data (e.g. /content/admire_data)
-            split: 'Train', 'Dev', or 'Test'
-            mode: 'qwen' (returns file paths) or 'fusion' (returns pixel tensors)
-        """
         self.mode = mode
         
         # 1. AUTO-FIND TSV
-        print(f"🕵️ Scanning {data_root_path} for {split} data...")
+        print(f"🕵️ Scanning {data_root_path} for {split} TSV...")
         tsv_candidates = glob.glob(os.path.join(data_root_path, "**", f"*{split}*.tsv"), recursive=True)
-        
         if not tsv_candidates:
-             # Fallback: Find ANY tsv if specific split not found
              tsv_candidates = glob.glob(os.path.join(data_root_path, "**", "*.tsv"), recursive=True)
         
         if not tsv_candidates:
             raise FileNotFoundError(f"❌ TSV file not found in {data_root_path}")
             
         self.tsv_path = tsv_candidates[0]
-        self.data_root = os.path.dirname(self.tsv_path) # Images are anchored to the TSV location
-        
-        print(f"✅ Loaded: {self.tsv_path}")
+        print(f"✅ Loaded TSV: {self.tsv_path}")
         self.df = pd.read_csv(self.tsv_path, sep='\t')
+
+        # 2. AUTO-DETECT IMAGE ROOT
+        # We search for the first image to locate the real root folder
+        first_img_name = self.df.iloc[0]['image1_name']
+        found_images = glob.glob(os.path.join(data_root_path, "**", first_img_name), recursive=True)
         
-        # 2. TRANSFORM (Only used if mode='fusion')
+        if not found_images:
+            tsv_dir = os.path.dirname(self.tsv_path)
+            found_images = glob.glob(os.path.join(tsv_dir, "**", first_img_name), recursive=True)
+
+        if found_images:
+            full_path = found_images[0]
+            compound_folder = str(self.df.iloc[0]['compound'])
+            
+            # Check if image is inside a compound folder
+            if compound_folder in full_path:
+                split_point = full_path.find(compound_folder)
+                self.image_root = full_path[:split_point]
+            else:
+                self.image_root = os.path.dirname(full_path)
+            print(f"✅ Images located at: {self.image_root}")
+        else:
+            print("⚠️ WARNING: Could not auto-detect root. Using provided path.")
+            self.image_root = data_root_path
+
+        # 3. TRANSFORM (For Fusion)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -46,17 +60,31 @@ class AdMIReReader(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        idiom_folder = str(row['compound'])
+        idiom_folder_raw = str(row['compound'])
         
-        # 3. ROBUST IMAGE FINDING
+        # --- FIX: HANDLE APOSTROPHES (devil's -> devil_s) ---
+        # 1. Check if the folder exists exactly as written
+        path_exact = os.path.join(self.image_root, idiom_folder_raw)
+        
+        # 2. Check if it exists with apostrophe replaced by underscore
+        idiom_folder_sanitized = idiom_folder_raw.replace("'", "_")
+        path_sanitized = os.path.join(self.image_root, idiom_folder_sanitized)
+        
+        if os.path.exists(path_exact):
+            final_folder = idiom_folder_raw
+        elif os.path.exists(path_sanitized):
+            final_folder = idiom_folder_sanitized
+        else:
+            final_folder = idiom_folder_raw # Fallback (will fail later if missing)
+
         img_paths = []
         for i in range(1, 6):
             fname = row[f'image{i}_name']
             
-            # Try Path A: root/idiom/filename (Standard)
-            path_a = os.path.join(self.data_root, idiom_folder, fname)
-            # Try Path B: root/filename (Fallback if flattened)
-            path_b = os.path.join(self.data_root, fname)
+            # Try with detected folder (Standard)
+            path_a = os.path.join(self.image_root, final_folder, fname)
+            # Try flat (Fallback)
+            path_b = os.path.join(self.image_root, fname)
             
             if os.path.exists(path_a): final = path_a
             elif os.path.exists(path_b): final = path_b
@@ -64,7 +92,7 @@ class AdMIReReader(Dataset):
             
             img_paths.append(final)
 
-        # 4. GET LABEL
+        # GET LABEL
         try:
             gold_list = ast.literal_eval(row['expected_order'])
             winner = gold_list[0]
@@ -73,16 +101,13 @@ class AdMIReReader(Dataset):
         except:
             label = 0
 
-        # 5. RETURN BASED ON MODE
-        # --- MODE: QWEN ---
+        # RETURN
         if self.mode == 'qwen':
             return {
                 "image_paths": img_paths,
                 "text": row['sentence'],
                 "label": label
             }
-            
-        # --- MODE: FUSION ---
         elif self.mode == 'fusion':
             tensors = []
             for p in img_paths:
@@ -96,7 +121,6 @@ class AdMIReReader(Dataset):
                     t = torch.zeros(3, 224, 224)
                 tensors.append(t)
             
-            # Stack 5 images -> [5, 3, 224, 224]
             return {
                 "pixel_values": torch.stack(tensors),
                 "raw_text": row['sentence'],
